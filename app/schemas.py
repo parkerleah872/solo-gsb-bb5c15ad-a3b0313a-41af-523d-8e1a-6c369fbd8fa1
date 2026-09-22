@@ -11,6 +11,8 @@ MAX_SPANS = 5_000
 MAX_TTL_REQ = 7 * 86400
 MAX_PATTERN_LEN = 2_000
 MAX_POLICY_RULES = 200
+# 批量恢复单批项数上限：防止超大请求长时间占用写事务
+MAX_BATCH_RESTORE_ITEMS = 20
 
 
 class SpanIn(BaseModel):
@@ -113,6 +115,30 @@ class RestoreResponse(BaseModel):
     restored: list[RestoredItem]
     restore_token: str = Field(..., description="轮换后的新一次性令牌")
     token_expires_at: datetime
+
+
+# ---------- 批量恢复 ----------
+
+
+class RestoreBatchItem(BaseModel):
+    token: str = Field(..., min_length=1, max_length=128)
+    placeholders: list[str] = Field(..., min_length=1, max_length=100)
+
+
+class RestoreBatchRequest(BaseModel):
+    items: list[RestoreBatchItem] = Field(
+        ..., min_length=1, max_length=MAX_BATCH_RESTORE_ITEMS
+    )
+
+
+class RestoreBatchResultItem(BaseModel):
+    restored: list[RestoredItem]
+    restore_token: str = Field(..., description="该项轮换后的新一次性令牌")
+    token_expires_at: datetime
+
+
+class RestoreBatchResponse(BaseModel):
+    results: list[RestoreBatchResultItem]
 
 
 # ---------- 自动脱敏策略 ----------

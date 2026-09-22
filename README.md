@@ -5,7 +5,8 @@
 1. 按 **原始 Unicode 码位位置** 一次性解析全部片段，确定性消解重叠；
 2. 生成 **稳定占位符**（同文档内相同「类别 + 原文」复用同一占位符）；
 3. 原文与片段映射经 **Fernet 对称加密** 后存入 SQLite，且 **可过期**（定时 + 懒清理）；
-4. 恢复接口仅认 **一次性令牌**：用后作废并轮换，只能还原请求中显式指定的占位符。
+4. 恢复接口仅认 **一次性令牌**：用后作废并轮换，只能还原请求中显式指定的占位符；
+   另提供**批量恢复**（单批 1～20 项，单事务全量校验、整体原子生效）。
 
 此外支持**可复用的自动脱敏策略**：一条策略由多条规则（`rule_id`、类别、正则、
 优先级）组成，创建后不可变。提交文档时可传 `policy_id`，服务端直接在 Unicode
@@ -198,7 +199,59 @@ python -m pytest -q
   会返回全部出现位置，并逐一标注 `source` / `rule_id`）；
 - 令牌无效 / 已用 / 过期 → `401`；占位符不属于文档 → `400`；文档已过期 → `410`。
 
-### 6. 健康检查 `GET /health` → `{"status": "ok"}`
+### 6. 批量一次性恢复 `POST /restore/batch`
+
+一次请求恢复多份文档的占位符（**1～20 项**），每项各自携带令牌与显式占位符列表：
+
+```json
+{
+  "items": [
+    {"token": "6c538c2c…", "placeholders": ["{{MONEY:01}}"]},
+    {"token": "9f0ab1d2…", "placeholders": ["{{PERSON:01}}", "{{ORG:02}}"]}
+  ]
+}
+```
+
+响应**按请求顺序**逐项返回恢复结果与轮换后的新令牌：
+
+```json
+{
+  "results": [
+    {
+      "restored": [
+        {
+          "placeholder": "{{MONEY:01}}",
+          "category": "MONEY",
+          "value": "人民币10000元",
+          "occurrences": [
+            {"start": 11, "end": 20, "priority": 3, "source": "auto", "rule_id": "money"}
+          ]
+        }
+      ],
+      "restore_token": "该项轮换后的新一次性令牌…",
+      "token_expires_at": "…"
+    },
+    {
+      "restored": [ /* 第二项的恢复结果 */ ],
+      "restore_token": "…",
+      "token_expires_at": "…"
+    }
+  ]
+}
+```
+
+规则：
+
+- 整批在**单个 SQLite IMMEDIATE 事务**中执行：先校验**所有**令牌未使用、未过期、
+  所属文档仍有效且占位符均属于对应文档，再一次性作废全部旧令牌并为每项轮换新令牌；
+- **任一项失败即整体回滚**：不作废任何令牌、不签发新令牌，响应中也不包含其他项
+  的恢复值（即不产生部分副作用）；
+- 错误码与单条恢复一致：令牌无效 / 已用 / 过期 → `401`；占位符不属于对应文档 →
+  `400`；文档已过期 → `410`；
+- 同一批次内令牌不得重复（一次性令牌不允许被消费两次），重复返回 `400`；
+- 每项的 `placeholders` 规则与单条恢复相同（必填、格式合法、自动去重）。
+
+### 7. 健康检查 `GET /health` → `{"status": "ok"}`
 
 ---
 
@@ -320,7 +373,7 @@ app/
     policy_service.py   自动脱敏策略创建 / 查询（不可变）
     timeutil.py         ISO-8601 UTC 时间工具
     errors.py           服务层错误 -> HTTP 状态码
-  routers/__init__.py    /policies、/documents、/documents/{id}、/restore、/health
+  routers/__init__.py    /policies、/documents、/documents/{id}、/restore、/restore/batch、/health
   cli.py                keygen / initdb 命令
 tests/                  核心算法单元测试 + API 端到端测试（含超时 / 空匹配）
 Dockerfile              非 root 运行、内置健康检查
