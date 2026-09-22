@@ -1,0 +1,26 @@
+services:
+  api:
+    build: .
+    image: contract-redaction-api:latest
+    ports:
+      - "8000:8000"
+    environment:
+      # 单命令启动可直接使用此开发密钥；生产请替换为 `python -m app.cli keygen` 的输出
+      REDACT_MASTER_KEY: "${REDACT_MASTER_KEY:-dev-insecure-key-change-me-please-0123456789}"
+      REDACT_ENV: "${REDACT_ENV:-production}"
+      REDACT_DATABASE_URL: "/data/redaction.db"
+      REDACT_DEFAULT_TTL: "86400"        # 文档映射默认 1 天过期
+      REDACT_TOKEN_TTL: "600"            # 一次性恢复令牌 10 分钟过期
+      REDACT_RULE_TIMEOUT: "1.0"         # 单条自动脱敏规则执行超时（秒），超时整次提交 422
+      REDACT_CLEANUP_INTERVAL: "300"
+    volumes:
+      - redaction-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  redaction-data:
