@@ -11,6 +11,9 @@ from app.main import app
 TEXT = "甲方：北京某某科技有限公司，授权代表张三，联系北京某某科技有限公司。"
 # 码位：甲0 方1 ：2 北3 京4 某5 某6 科7 技8 有9 限10 公11 司12 ，13 ...
 
+TEXT2 = "联系人李四，电话13800001111。"
+# 码位：联0 系1 人2 李3 四4 ，5 电6 话7 1..1(8~18) 。19
+
 
 def _payload(ttl=None, token_ttl=None):
     spans = [
@@ -23,6 +26,17 @@ def _payload(ttl=None, token_ttl=None):
         {"start": 3, "end": 33, "priority": 0, "category": "BLOCK"},
     ]
     body: dict = {"text": TEXT, "spans": spans}
+    if ttl is not None:
+        body["ttl"] = ttl
+    return body
+
+
+def _payload2(ttl=None):
+    spans = [
+        {"start": 3, "end": 5, "priority": 5, "category": "person"},
+        {"start": 8, "end": 19, "priority": 3, "category": "phone"},
+    ]
+    body: dict = {"text": TEXT2, "spans": spans}
     if ttl is not None:
         body["ttl"] = ttl
     return body
@@ -99,6 +113,166 @@ async def test_restore_bad_token(client):
         json={"token": "deadbeef" * 8, "placeholders": ["{{ORG:01}}"]},
     )
     assert resp.status_code == 401
+
+
+# ---------- 批量恢复 POST /restore/batch ----------
+
+
+async def test_restore_batch_full_flow(client):
+    d1 = (await client.post("/documents", json=_payload())).json()
+    d2 = (await client.post("/documents", json=_payload2())).json()
+
+    resp = await client.post(
+        "/restore/batch",
+        json={
+            "items": [
+                {"token": d1["restore_token"], "placeholders": ["{{PERSON:01}}"]},
+                {
+                    "token": d2["restore_token"],
+                    "placeholders": ["{{PHONE:01}}", "{{PERSON:01}}"],
+                },
+            ]
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    assert len(results) == 2
+
+    # 按请求顺序逐项返回
+    assert results[0]["restored"][0]["value"] == "张三"
+    values2 = {i["placeholder"]: i["value"] for i in results[1]["restored"]}
+    assert values2 == {"{{PHONE:01}}": "13800001111", "{{PERSON:01}}": "李四"}
+    assert results[0]["token_expires_at"] and results[1]["token_expires_at"]
+
+    # 每项轮换出相互独立的新令牌
+    t1, t2 = results[0]["restore_token"], results[1]["restore_token"]
+    assert t1 != d1["restore_token"]
+    assert t2 != d2["restore_token"]
+    assert t1 != t2
+
+    # 旧令牌全部作废
+    for old in (d1["restore_token"], d2["restore_token"]):
+        reused = await client.post(
+            "/restore", json={"token": old, "placeholders": ["{{PERSON:01}}"]}
+        )
+        assert reused.status_code == 401
+
+    # 新令牌可继续使用
+    again = await client.post(
+        "/restore", json={"token": t2, "placeholders": ["{{PERSON:01}}"]}
+    )
+    assert again.status_code == 200
+    assert again.json()["restored"][0]["value"] == "李四"
+
+
+async def test_restore_batch_single_item(client):
+    d = (await client.post("/documents", json=_payload())).json()
+    resp = await client.post(
+        "/restore/batch",
+        json={"items": [{"token": d["restore_token"], "placeholders": ["{{ORG:01}}"]}]},
+    )
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    assert len(results) == 1
+    assert results[0]["restored"][0]["value"] == "北京某某科技有限公司"
+
+
+async def test_restore_batch_rolls_back_on_bad_token(client):
+    d1 = (await client.post("/documents", json=_payload())).json()
+    await client.post("/documents", json=_payload2())
+
+    resp = await client.post(
+        "/restore/batch",
+        json={
+            "items": [
+                {"token": d1["restore_token"], "placeholders": ["{{ORG:01}}"]},
+                {"token": "deadbeef" * 8, "placeholders": ["{{PERSON:01}}"]},
+            ]
+        },
+    )
+    assert resp.status_code == 401
+    # 不泄露任何恢复值
+    assert "restored" not in resp.json()
+
+    # 整体回滚：第一项的令牌未被作废，也不存在部分副作用
+    again = await client.post(
+        "/restore",
+        json={"token": d1["restore_token"], "placeholders": ["{{ORG:01}}"]},
+    )
+    assert again.status_code == 200
+    assert again.json()["restored"][0]["value"] == "北京某某科技有限公司"
+
+
+async def test_restore_batch_unknown_placeholder_rolls_back(client):
+    d1 = (await client.post("/documents", json=_payload())).json()
+    d2 = (await client.post("/documents", json=_payload2())).json()
+
+    resp = await client.post(
+        "/restore/batch",
+        json={
+            "items": [
+                {"token": d1["restore_token"], "placeholders": ["{{ORG:01}}"]},
+                {"token": d2["restore_token"], "placeholders": ["{{MONEY:99}}"]},
+            ]
+        },
+    )
+    assert resp.status_code == 400
+
+    # 第一项未产生副作用：令牌仍可用
+    again = await client.post(
+        "/restore",
+        json={"token": d1["restore_token"], "placeholders": ["{{ORG:01}}"]},
+    )
+    assert again.status_code == 200
+
+
+async def test_restore_batch_duplicate_token_rejected(client):
+    d = (await client.post("/documents", json=_payload())).json()
+    item = {"token": d["restore_token"], "placeholders": ["{{ORG:01}}"]}
+    resp = await client.post("/restore/batch", json={"items": [item, item]})
+    assert resp.status_code == 401
+
+    # 一次性令牌未被消耗
+    again = await client.post(
+        "/restore",
+        json={"token": d["restore_token"], "placeholders": ["{{ORG:01}}"]},
+    )
+    assert again.status_code == 200
+
+
+async def test_restore_batch_size_limits(client):
+    resp = await client.post("/restore/batch", json={"items": []})
+    assert resp.status_code == 422
+
+    items = [
+        {"token": f"t{i}", "placeholders": ["{{ORG:01}}"]} for i in range(21)
+    ]
+    resp = await client.post("/restore/batch", json={"items": items})
+    assert resp.status_code == 422
+
+
+async def test_restore_batch_expired_item_rolls_back(client):
+    short = (await client.post("/documents", json=_payload(ttl=1))).json()
+    long = (await client.post("/documents", json=_payload(ttl=3600))).json()
+
+    await asyncio.sleep(1.1)
+    resp = await client.post(
+        "/restore/batch",
+        json={
+            "items": [
+                {"token": short["restore_token"], "placeholders": ["{{ORG:01}}"]},
+                {"token": long["restore_token"], "placeholders": ["{{ORG:01}}"]},
+            ]
+        },
+    )
+    assert resp.status_code in (401, 410)
+
+    # 整体回滚：未过期文档的令牌未被作废
+    again = await client.post(
+        "/restore",
+        json={"token": long["restore_token"], "placeholders": ["{{ORG:01}}"]},
+    )
+    assert again.status_code == 200
 
 
 async def test_get_missing_document_404(client):

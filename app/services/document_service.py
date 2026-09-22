@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import aiosqlite
 
@@ -19,6 +19,7 @@ from app.redaction import (
 from app.schemas import (
     FragmentOut,
     MAX_SPANS,
+    RestoreBatchItem,
     RestoredItem,
     RestoredOccurrence,
     SubmitRequest,
@@ -35,6 +36,10 @@ from app.services.timeutil import from_iso, to_iso, utcnow
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+class _TokenExpiredError(UnauthorizedError):
+    """令牌过期（401）；单条恢复接口借此识别该情形以顺手物理删除过期令牌。"""
 
 
 class DocumentService:
@@ -222,77 +227,27 @@ class DocumentService:
         async with self.db.cursor() as cur:
             # 单事务内完成：校验一次性令牌 -> 读出片段 -> 旧令牌作废 -> 轮换新令牌
             await cur.execute("BEGIN IMMEDIATE")
-            await cur.execute(
-                "SELECT document_id, expires_at, used FROM restore_tokens"
-                " WHERE token_hash = ?",
-                (hash_token(token),),
-            )
-            token_row = await cur.fetchone()
-            if token_row is None:
-                await cur.execute("ROLLBACK")
-                raise UnauthorizedError("恢复令牌无效（可能已被使用）")
-            if token_row["used"]:
-                await cur.execute("ROLLBACK")
-                raise UnauthorizedError("恢复令牌已使用")
-            if from_iso(token_row["expires_at"]) <= now:
+            try:
+                token_hash, doc_id, doc_expires, restored = await self._collect_restore(
+                    cur, token, wanted, now
+                )
+            except _TokenExpiredError:
+                # 过期令牌即时物理删除（其余校验失败一律回滚，不留写副作用）
                 await cur.execute(
                     "DELETE FROM restore_tokens WHERE token_hash = ?",
                     (hash_token(token),),
                 )
                 await cur.execute("COMMIT")
-                raise UnauthorizedError("恢复令牌已过期，请重新提交文档")
-
-            doc_id = token_row["document_id"]
-            await cur.execute("SELECT expires_at FROM documents WHERE id = ?", (doc_id,))
-            doc_row = await cur.fetchone()
-            if doc_row is None or from_iso(doc_row["expires_at"]) <= now:
+                raise
+            except ServiceError:
                 await cur.execute("ROLLBACK")
-                raise ExpiredError("文档映射已过期，无法恢复")
-            doc_expires = from_iso(doc_row["expires_at"])
-
-            await cur.execute(
-                "SELECT placeholder, category, start_offset, end_offset, priority,"
-                " cipher_value, source, rule_id FROM fragments"
-                " WHERE document_id = ? AND kept = 1 ORDER BY start_offset",
-                (doc_id,),
-            )
-            frag_rows = await cur.fetchall()
-
-            by_placeholder: dict[str, list[aiosqlite.Row]] = {}
-            for r in frag_rows:
-                by_placeholder.setdefault(r["placeholder"], []).append(r)
-
-            unknown = [p for p in wanted if p not in by_placeholder]
-            if unknown:
-                await cur.execute("ROLLBACK")
-                raise ServiceError(f"占位符不属于该文档：{unknown}", 400)
-
-            restored: list[RestoredItem] = []
-            for p in wanted:
-                rows = by_placeholder[p]
-                restored.append(
-                    RestoredItem(
-                        placeholder=p,
-                        category=rows[0]["category"],
-                        value=self.crypto.decrypt(rows[0]["cipher_value"]),
-                        occurrences=[
-                            RestoredOccurrence(
-                                start=r["start_offset"],
-                                end=r["end_offset"],
-                                priority=r["priority"],
-                                source=r["source"],
-                                rule_id=r["rule_id"],
-                            )
-                            for r in rows
-                        ],
-                    )
-                )
+                raise
 
             new_token = random_token()
             new_expires = min(now + timedelta(seconds=self.token_ttl), doc_expires)
             await cur.execute(
                 "UPDATE restore_tokens SET used = 1 WHERE token_hash = ?",
-                (hash_token(token),),
+                (token_hash,),
             )
             await cur.execute(
                 "INSERT INTO restore_tokens (token_hash, document_id, expires_at, used)"
@@ -306,6 +261,130 @@ class DocumentService:
             "restore_token": new_token,
             "token_expires_at": new_expires,
         }
+
+    # ---------- 批量一次性令牌恢复 ----------
+
+    async def restore_batch(self, items: list[RestoreBatchItem]) -> dict:
+        # 先完成全部占位符格式校验 / 去重（格式非法 -> 422，不开启事务）
+        prepared = [(item.token, self._dedup(item.placeholders)) for item in items]
+        now = utcnow()
+
+        async with self.db.cursor() as cur:
+            # 单个 IMMEDIATE 事务：先校验全部项，再统一作废 / 轮换；
+            # 任一项失败整体回滚，不产生部分副作用，也不返回任何恢复值
+            await cur.execute("BEGIN IMMEDIATE")
+            try:
+                # 第一阶段（只读）：逐项校验令牌、文档与占位符，收集恢复数据
+                staged: list[tuple[str, str, datetime, list[RestoredItem]]] = []
+                seen_hashes: set[str] = set()
+                for token, wanted in prepared:
+                    token_hash = hash_token(token)
+                    if token_hash in seen_hashes:
+                        raise UnauthorizedError("同一令牌在批量请求中重复出现")
+                    seen_hashes.add(token_hash)
+                    staged.append(await self._collect_restore(cur, token, wanted, now))
+
+                # 第二阶段（写入）：全部校验通过后，一次性作废旧令牌并逐项轮换
+                results: list[dict] = []
+                for token_hash, doc_id, doc_expires, restored in staged:
+                    new_token = random_token()
+                    new_expires = min(
+                        now + timedelta(seconds=self.token_ttl), doc_expires
+                    )
+                    await cur.execute(
+                        "UPDATE restore_tokens SET used = 1 WHERE token_hash = ?",
+                        (token_hash,),
+                    )
+                    await cur.execute(
+                        "INSERT INTO restore_tokens"
+                        " (token_hash, document_id, expires_at, used)"
+                        " VALUES (?, ?, ?, 0)",
+                        (hash_token(new_token), doc_id, to_iso(new_expires)),
+                    )
+                    results.append(
+                        {
+                            "restored": restored,
+                            "restore_token": new_token,
+                            "token_expires_at": new_expires,
+                        }
+                    )
+                await cur.execute("COMMIT")
+            except ServiceError:
+                await cur.execute("ROLLBACK")
+                raise
+
+        return {"results": results}
+
+    async def _collect_restore(
+        self,
+        cur: aiosqlite.Cursor,
+        token: str,
+        wanted: list[str],
+        now: datetime,
+    ) -> tuple[str, str, datetime, list[RestoredItem]]:
+        """校验单个恢复令牌并收集恢复数据（只读；事务与回滚由调用方负责）。
+
+        返回 ``(token_hash, document_id, doc_expires, restored)``；
+        令牌过期抛 ``_TokenExpiredError``（401），其余校验失败抛对应 ServiceError。
+        """
+        token_hash = hash_token(token)
+        await cur.execute(
+            "SELECT document_id, expires_at, used FROM restore_tokens"
+            " WHERE token_hash = ?",
+            (token_hash,),
+        )
+        token_row = await cur.fetchone()
+        if token_row is None:
+            raise UnauthorizedError("恢复令牌无效（可能已被使用）")
+        if token_row["used"]:
+            raise UnauthorizedError("恢复令牌已使用")
+        if from_iso(token_row["expires_at"]) <= now:
+            raise _TokenExpiredError("恢复令牌已过期，请重新提交文档")
+
+        doc_id = token_row["document_id"]
+        await cur.execute("SELECT expires_at FROM documents WHERE id = ?", (doc_id,))
+        doc_row = await cur.fetchone()
+        if doc_row is None or from_iso(doc_row["expires_at"]) <= now:
+            raise ExpiredError("文档映射已过期，无法恢复")
+        doc_expires = from_iso(doc_row["expires_at"])
+
+        await cur.execute(
+            "SELECT placeholder, category, start_offset, end_offset, priority,"
+            " cipher_value, source, rule_id FROM fragments"
+            " WHERE document_id = ? AND kept = 1 ORDER BY start_offset",
+            (doc_id,),
+        )
+        frag_rows = await cur.fetchall()
+
+        by_placeholder: dict[str, list[aiosqlite.Row]] = {}
+        for r in frag_rows:
+            by_placeholder.setdefault(r["placeholder"], []).append(r)
+
+        unknown = [p for p in wanted if p not in by_placeholder]
+        if unknown:
+            raise ServiceError(f"占位符不属于该文档：{unknown}", 400)
+
+        restored: list[RestoredItem] = []
+        for p in wanted:
+            rows = by_placeholder[p]
+            restored.append(
+                RestoredItem(
+                    placeholder=p,
+                    category=rows[0]["category"],
+                    value=self.crypto.decrypt(rows[0]["cipher_value"]),
+                    occurrences=[
+                        RestoredOccurrence(
+                            start=r["start_offset"],
+                            end=r["end_offset"],
+                            priority=r["priority"],
+                            source=r["source"],
+                            rule_id=r["rule_id"],
+                        )
+                        for r in rows
+                    ],
+                )
+            )
+        return token_hash, doc_id, doc_expires, restored
 
     # ---------- 过期清理 ----------
 

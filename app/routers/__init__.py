@@ -7,6 +7,8 @@ from app.schemas import (
     DocumentResponse,
     PolicyCreateRequest,
     PolicyResponse,
+    RestoreBatchRequest,
+    RestoreBatchResponse,
     RestoreRequest,
     RestoreResponse,
     SubmitRequest,
@@ -78,3 +80,13 @@ async def restore(
 ) -> dict:
     """凭一次性令牌还原指定占位符；令牌用后作废并轮换返回新令牌。"""
     return await service.restore(payload.token, payload.placeholders)
+
+
+@router.post("/restore/batch", response_model=RestoreBatchResponse)
+async def restore_batch(
+    payload: RestoreBatchRequest,
+    service: DocumentService = Depends(get_service),
+) -> dict:
+    """批量恢复（1~20 项）：单事务内先校验全部令牌再统一作废轮换；
+    任一项失败整体回滚，不产生部分副作用，响应按请求顺序逐项返回。"""
+    return await service.restore_batch(payload.items)

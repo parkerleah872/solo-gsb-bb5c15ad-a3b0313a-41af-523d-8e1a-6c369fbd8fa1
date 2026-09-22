@@ -11,6 +11,7 @@ MAX_SPANS = 5_000
 MAX_TTL_REQ = 7 * 86400
 MAX_PATTERN_LEN = 2_000
 MAX_POLICY_RULES = 200
+MAX_RESTORE_BATCH = 20
 
 
 class SpanIn(BaseModel):
@@ -113,6 +114,32 @@ class RestoreResponse(BaseModel):
     restored: list[RestoredItem]
     restore_token: str = Field(..., description="轮换后的新一次性令牌")
     token_expires_at: datetime
+
+
+class RestoreBatchItem(BaseModel):
+    token: str = Field(..., min_length=1, max_length=128)
+    placeholders: list[str] = Field(..., min_length=1, max_length=100)
+
+
+class RestoreBatchRequest(BaseModel):
+    items: list[RestoreBatchItem] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_RESTORE_BATCH,
+        description="1~20 项；每项为独立的一次性令牌与显式占位符列表",
+    )
+
+
+class RestoreBatchResult(BaseModel):
+    restored: list[RestoredItem]
+    restore_token: str = Field(..., description="该项轮换后的新一次性令牌")
+    token_expires_at: datetime
+
+
+class RestoreBatchResponse(BaseModel):
+    results: list[RestoreBatchResult] = Field(
+        ..., description="按请求顺序与 items 一一对应"
+    )
 
 
 # ---------- 自动脱敏策略 ----------
